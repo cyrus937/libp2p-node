@@ -1,0 +1,27 @@
+[package]
+name = "node"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "node"
+# "cdylib" is necessary to produce a shared library for Python to import from.
+#
+# Downstream Rust code (including code in `bin/`, `examples/`, and `tests/`) will not be able
+# to `use string_sum;` unless the "rlib" or "lib" crate type is also included, e.g.:
+# crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
+
+[dependencies]
+tokio = { version = "1.33", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3.29"
+libp2p = { version = "0.53.1", features = [ "tokio", "gossipsub", "mdns", "noise", "macros", "tcp", "yamux", "quic", "rendezvous", "identify"] }
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bs58 = "0.5.0"
+pyo3 = {version = "0.20.0", features = ["extension-module"]}
+pyo3-asyncio = { version = "0.20", features = ["attributes", "async-std-runtime"] }
+async-std = "1.9"
