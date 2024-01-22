@@ -1,186 +1,252 @@
-use futures::StreamExt;
-use libp2p::swarm::SwarmEvent;
-use libp2p::Swarm;
+use futures::channel::{mpsc, oneshot};
+use futures::{prelude::*, SinkExt};
 use libp2p::{
-    core::multiaddr::Multiaddr, gossipsub, mdns, noise, swarm::NetworkBehaviour, tcp, yamux, PeerId,
+    futures::StreamExt,
+    gossipsub::{self, MessageId, TopicHash},
+    mdns, noise,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    tcp, yamux, PeerId, Swarm,
 };
-use pyo3::{prelude::*, wrap_pyfunction};
-use std::collections::hash_map::DefaultHasher;
-use std::collections::HashSet;
-use std::error::Error;
-use std::hash::{Hash, Hasher};
-use std::str::FromStr;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::io::AsyncBufReadExt;
-use tokio::sync::mpsc;
-use tokio::{io, select};
+use pyo3::prelude::*;
+use std::collections::HashMap;
+use std::{
+    collections::{hash_map::DefaultHasher, HashSet},
+    error::Error,
+    hash::{Hash, Hasher},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::io;
+use tokio::runtime::Handle;
 use tracing_subscriber::EnvFilter;
 
-// We create a custom network behaviour that combines Gossipsub and Mdns.
 #[derive(NetworkBehaviour)]
 pub struct MyBehaviour {
     pub gossipsub: gossipsub::Behaviour,
     mdns: mdns::tokio::Behaviour,
 }
 
+#[derive(Clone)]
 #[pyclass(name = "Node", subclass)]
 pub struct Node {
     pub id: PeerId,
-    pub node_listening: HashSet<Multiaddr>,
-    pub peers_id: HashSet<PeerId>,
-    pub swarm: Swarm<MyBehaviour>,
-    pub topic: gossipsub::IdentTopic,
+    pub message: String,
+    #[pyo3(get, set)]
+    pub connected_peers: HashSet<String>,
+    #[pyo3(get, set)]
+    pub discovered_peers: HashSet<String>,
+    #[pyo3(get, set)]
+    pub listening_address: HashSet<String>,
+    pub swarm: Arc<tokio::sync::Mutex<Swarm<MyBehaviour>>>,
+    command_receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<Command>>>,
+    event_sender: mpsc::Sender<Event>,
+}
+
+#[derive(Clone)]
+#[pyclass(name = "Client", subclass)]
+pub struct Client {
+    id: PeerId,
+    sender: mpsc::Sender<Command>,
+    topics: HashMap<String, TopicHash>,
+}
+
+#[derive(Clone)]
+#[pyclass(name = "Network", subclass)]
+pub struct Network {
+    #[pyo3(get, set)]
+    pub client: Client,
+    #[pyo3(get, set)]
+    pub node: Node,
+    event_receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<Event>>>,
+}
+
+#[derive(Clone)]
+pub struct Test<'a> {
+    pub node: &'a Node,
 }
 
 #[pymodule]
-fn node(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+fn pyo3_example(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<Node>()?;
-    m.add_wrapped(wrap_pyfunction!(create_run))?;
+    m.add_class::<Client>()?;
+    m.add_class::<Network>()?;
     Ok(())
-}
-pub enum EventType {
-    Response(String),
-    Input(String),
 }
 
 #[pymethods]
-impl Node {
-    ///----------------------ERROR--------------------
+impl Network {
     #[new]
-    pub fn new(
-        address: Option<&str>,
+    pub fn new<'a>(
+        address: Option<&'a str>,
         port: Option<u32>,
         tcp: Option<bool>,
         udp: Option<bool>,
-        msg_topic: Option<&str>,
-    ) -> Self {
+        msg_topic: Option<&'a str>,
+    ) -> PyResult<Network> {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let node = rt.block_on(async {
+        let t = rt.block_on(async {
             create_node(address, port, tcp, udp, msg_topic)
                 .await
                 .unwrap()
         });
-        node
+        let node = t.2;
+
+        Ok(Network {
+            client: t.0,
+            node,
+            event_receiver: t.1,
+        })
     }
 
-    fn run(&mut self) -> PyResult<()> {
+    fn run<'py>(&self, py: Python<'py>) {
+        let network = self.clone();
+        let handle = tokio::runtime::Runtime::new().unwrap();
+        let _ = handle.block_on(async {
+            let mut node = network.node;
+            let swarm_arc_clone = Arc::clone(&node.swarm);
+            let mut swarm_guard = swarm_arc_clone.lock().await;
+            let swarm = &mut *swarm_guard;
+
+            let command_arc_clone = Arc::clone(&node.command_receiver);
+            let mut command_guard = command_arc_clone.lock().await;
+            let command_receiver = &mut *command_guard;
+
+            loop {
+                // let evt = {
+                futures::select! {
+                    event = swarm.next() => handle_event(&mut node, event.expect("Swarm stream to be infinite."), swarm).await,
+                    command = command_receiver.next() => match command {
+                        Some(c) => {
+                            handle_command(&mut node, c, swarm).await},
+                        // Command channel closed, thus shutting down the network event loop.
+                        None=>  {},
+                    },
+                };
+            }
+        }
+        );
+        println!("Out of the runtime");
+    }
+
+    fn subscribe_topic(&mut self, topic: String) {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            async_run(self).await;
-        });
-        Ok(())
-    }
-    ///-------------------------------------------------
-    
-    #[getter]
-    fn get_id(&self) -> PyResult<String> {
-        Ok(self.id.to_string())
+        // let rt = Handle::current();
+        let _ = rt.block_on(async { self.client.async_subscribe_topic(topic).await });
     }
 
+    fn unsubscribe_topic(&mut self, topic: String) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // let rt = Handle::current();
+        let _ = rt.block_on(async { self.client.async_unsubscribe_topic(topic).await });
+    }
 
-    fn handle_list_peers(&mut self) -> PyResult<()> {
-        println!("Discovered Peers:");
-        let nodes = self.swarm.behaviour().mdns.discovered_nodes();
-        let mut unique_peers = HashSet::new();
-        for peer in nodes {
-            unique_peers.insert(peer);
-            self.peers_id.insert(*peer);
+    pub fn get_connected_peers(&mut self) -> HashSet<String> {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // let rt = Handle::current();
+        rt.block_on(async { self.client.async_get_connected_peers().await })
+    }
+
+    pub fn get_discovered_peers(&mut self) -> HashSet<String> {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // let rt = Handle::current();
+        rt.block_on(async { self.client.async_get_discovered_peers().await })
+    }
+
+    pub fn get_listening_address(&mut self) -> HashSet<String> {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // let rt = Handle::current();
+        rt.block_on(async { self.client.async_get_listening_address().await })
+    }
+
+    fn send_message(&mut self, topic: String, msg: String) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // let rt = Handle::current();
+        let _ = rt.block_on(async { self.client.async_send_message(topic, msg).await });
+    }
+}
+
+impl Client {
+    /// Subscribe to a new topic
+    async fn async_subscribe_topic(&mut self, topic: String) -> Result<(), Box<dyn Error + Send>> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::SubscribeTopic { topic, sender })
+            .await
+            .expect("Command receiver not to be dropped.");
+        receiver.await.expect("Sender not to be dropped.")
+    }
+
+    /// Unsubscribe to a topic
+    async fn async_unsubscribe_topic(
+        &mut self,
+        topic: String,
+    ) -> Result<(), Box<dyn Error + Send>> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::UnSubscribeTopic { topic, sender })
+            .await
+            .expect("Command receiver not to be dropped.");
+        receiver.await.expect("Sender not to be dropped.")
+    }
+
+    /// Get the list of connected peers
+    async fn async_get_connected_peers(&mut self) -> HashSet<String> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::GetConnectedPeers { sender })
+            .await
+            .expect("Command receiver not to be dropped.");
+        receiver.await.expect("Sender not to be dropped.")
+    }
+
+    /// Get the list of discovered peers
+    async fn async_get_discovered_peers(&mut self) -> HashSet<String> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::GetDiscoveredPeers { sender })
+            .await
+            .expect("Command receiver not to be dropped.");
+        let res = receiver.await.expect("Sender not to be dropped.");
+
+        for element in &res {
+            let peer_id = peer_id_from_str(element.as_str());
+            self.sender
+                .send(Command::ConnectPeer { peer_id })
+                .await
+                .expect("Error");
         }
-        unique_peers.iter().for_each(|p| println!("{}", p));
-        Ok(())
+
+        res
     }
 
-    pub fn send_message(&mut self, cmd: &str) {
-        if let Some(rest) = cmd.strip_prefix("send ") {
-            if let Err(e) = self
-                .swarm
-                .behaviour_mut()
-                .gossipsub
-                .publish(self.topic.clone(), rest.as_bytes())
-            {
-                println!("Publish error: {e:?}");
+    /// Get listening address
+    async fn async_get_listening_address(&mut self) -> HashSet<String> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::ListeningAddress { sender })
+            .await
+            .expect("Command receiver not to be dropped.");
+        receiver.await.expect("Sender not to be dropped.")
+    }
+
+    /// Get listening address
+    async fn async_send_message(&mut self, topic: String, message: String) {
+        let topic_hash = self.topics.get(&topic);
+        match topic_hash {
+            Some(val) => self
+                .sender
+                .send(Command::SendToOne {
+                    topic: val.clone(),
+                    message,
+                })
+                .await
+                .expect("Command receiver not to be dropped"),
+            None => {
+                println!("not found")
             }
-            // }
-        }
-    }
-
-    pub fn handle_list_listening_node(&mut self) {
-        println!("Local node is listenning on :");
-        self.swarm.listeners().for_each(|f| println!("{}", f));
-    }
-
-    #[pyo3(signature = (cmd))]
-    pub fn is_connected_to(&mut self, cmd: &str) {
-        if let Some(val) = cmd.strip_prefix("connected ") {
-            if val == "list" {
-                println!("Connected Peers : ");
-                self.swarm.connected_peers().for_each(|f| println!("{}", f));
-            } else {
-                let mut is_connected: bool = false;
-                let nodes = self.swarm.behaviour().mdns.discovered_nodes();
-                for peer in nodes {
-                    if peer.to_string().as_str() == val {
-                        is_connected = self.swarm.is_connected(&peer);
-                        // println!("ICI");
-                        break;
-                    }
-                }
-                if is_connected {
-                    println!("This node is connected to {}", val);
-                } else {
-                    println!("This node is not connected to {}", val);
-                }
-            }
-        }
-    }
-
-    pub fn disconnect_to(&mut self, cmd: &str) {
-        if let Some(val) = cmd.strip_prefix("disconnect ") {
-            let peer_id = peer_id_from_str(val);
-
-            let _ = self.swarm.disconnect_peer_id(peer_id);
-
-            self.swarm
-                .behaviour_mut()
-                .gossipsub
-                .remove_explicit_peer(&peer_id);
-        }
-    }
-
-    pub fn connect_to(&mut self, cmd: &str) {
-        if let Some(val) = cmd.strip_prefix("connect ") {
-            let peer_id = peer_id_from_str(val);
-
-            let _ = self
-                .swarm
-                .behaviour_mut()
-                .gossipsub
-                .add_explicit_peer(&peer_id);
         }
     }
 }
-
-fn peer_id_from_str(val: &str) -> PeerId {
-    let bytes = bs58::decode(val).into_vec().unwrap();
-    let peer_id = PeerId::from_bytes(&bytes).unwrap();
-    peer_id
-}
-
-
-#[pyfunction]
-fn create_run(address: Option<&str>,
-    port: Option<u32>,
-    tcp: Option<bool>,
-    udp: Option<bool>,
-    msg_topic: Option<&str>,
-) -> PyResult<()> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async { async_create_run(address, port, tcp, udp, msg_topic).await });
-    Ok(())
-}
-
-
 
 async fn create_node(
     address: Option<&str>,
@@ -188,7 +254,7 @@ async fn create_node(
     tcp: Option<bool>,
     udp: Option<bool>,
     msg_topic: Option<&str>,
-) -> Result<Node, Box<dyn Error>> {
+) -> Result<(Client, Arc<tokio::sync::Mutex<mpsc::Receiver<Event>>>, Node), Box<dyn Error>> {
     let addr: &str = match address {
         Some(val) => val,
         None => "0.0.0.0",
@@ -266,172 +332,253 @@ async fn create_node(
             .unwrap();
     }
 
-    Ok(Node {
+    let (command_sender, command_receiver) = mpsc::channel(10);
+    let (event_sender, event_receiver) = mpsc::channel(1);
+
+    let mut topics = HashMap::new();
+    topics.insert(msg_topic.unwrap().to_string(), topic.into());
+
+    let client = Client {
         id: *swarm.local_peer_id(),
-        node_listening: HashSet::new(),
-        peers_id: HashSet::new(),
-        swarm: swarm,
-        topic,
-    })
+        sender: command_sender,
+        topics,
+    };
+
+    let id = *swarm.local_peer_id();
+
+    let node = Node {
+        id,
+        message: String::new(),
+        connected_peers: HashSet::new(),
+        swarm: Arc::new(tokio::sync::Mutex::new(swarm)),
+        command_receiver: Arc::new(tokio::sync::Mutex::new(command_receiver)),
+        event_sender,
+        discovered_peers: HashSet::new(),
+        listening_address: HashSet::new(),
+    };
+
+    Ok((
+        client,
+        Arc::new(tokio::sync::Mutex::new(event_receiver)),
+        node,
+    ))
 }
 
-async fn async_run(node: &mut Node) {
-
-    println!("Peer ID : {}", node.id);
-    println!("Enter the command : ");
-    println!("ls p : list peers discovered.");
-    println!("ls l : local node listenning.");
-    println!("connected peerID : say if the local node is connected to this peerID.");
-    println!("connect peerID : connect local node to this peerID.");
-    println!("disconnect peerID : disconnect local node to this peerID.");
-    println!("connected list : list the connected node.");
-    println!("send message : send a message to all peers connected to this node.");
-    println!("stop : stop the process.");
-
-    let mut stdin = io::BufReader::new(io::stdin()).lines();
-
-    loop {
-        let evt = {
-            tokio::select! {
-                line = stdin.next_line() => Some(EventType::Input(line.expect("can get line").expect("can read line from stdin"))),
-                event = node.swarm.select_next_some() => match event {
-                    SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                                    propagation_source: peer_id,
-                                    message_id: id,
-                                    message,
-                                })) => {println!(
-                                        "Got message: '{}' with id: {id} from peer: {peer_id}",
-                                        String::from_utf8_lossy(&message.data),
-                                    );
-                                None
-                            },
-                                SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                                    for (peer_id, _multiaddr) in list {
-                                        node.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                                    }; None
-                                },
-                                SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
-                                    for (peer_id, _multiaddr) in list {
-                                        println!("mDNS discover peer has expired: {peer_id}");
-                                        node.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                                    }; None
-                                },
-                    _ => {None}
-                },
-            }
-        };
-
-        if let Some(event) = evt {
-            match event {
-                EventType::Response(resp) => {
-                
-                    println!("{}", resp)
-                }
-                EventType::Input(line) => match line.as_str() {
-                    "ls p" => async_handle_list_peers(node).await,
-                    "ls l" => node.handle_list_listening_node(),
-                    cmd if cmd.starts_with("send ") => node.send_message(cmd),
-                    cmd if cmd.starts_with("connected ") => node.is_connected_to(cmd),
-                    cmd if cmd.starts_with("connect ") => node.connect_to(cmd),
-                    cmd if cmd.starts_with("disconnect ") => node.disconnect_to(cmd),
-                    "stop" => break,
-                    _ => println!("unknown command"),
-                },
-            }
-        }
-    }
-}
-
-async fn async_create_run(
-    address: Option<&str>,
-    port: Option<u32>,
-    tcp: Option<bool>,
-    udp: Option<bool>,
-    msg_topic: Option<&str>,
+async fn handle_event(
+    node: &mut Node,
+    event: SwarmEvent<MyBehaviourEvent>,
+    swarm: &mut Swarm<MyBehaviour>,
 ) {
-
-    let mut node: Node = create_node(
-        address,
-        port,
-        tcp,
-        udp,
-        msg_topic,
-    )
-    .await
-    .unwrap();
-
-    println!("Peer ID : {}", node.id);
-    println!("Enter the command : ");
-    println!("ls p : list peers discovered.");
-    println!("ls l : local node listenning.");
-    println!("connected peerID : say if the local node is connected to this peerID.");
-    println!("connect peerID : connect local node to this peerID.");
-    println!("disconnect peerID : disconnect local node to this peerID.");
-    println!("connected list : list the connected node.");
-    println!("send message : send a message to all peers connected to this node.");
-    println!("stop : stop the process.");
-
-    let mut stdin = io::BufReader::new(io::stdin()).lines();
-
-    loop {
-        let evt = {
-            tokio::select! {
-                line = stdin.next_line() => Some(EventType::Input(line.expect("can get line").expect("can read line from stdin"))),
-                event = node.swarm.select_next_some() => match event {
-                    SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                                    propagation_source: peer_id,
-                                    message_id: id,
-                                    message,
-                                })) => {println!(
-                                        "Got message: '{}' with id: {id} from peer: {peer_id}",
-                                        String::from_utf8_lossy(&message.data),
-                                    );
-                                None
-                            },
-                                SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                                    for (peer_id, _multiaddr) in list {
-                                        // println!("mDNS discovered a new peer: {peer_id}");
-                                        node.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                                    }; None
-                                },
-                                SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
-                                    for (peer_id, _multiaddr) in list {
-                                        println!("mDNS discover peer has expired: {peer_id}");
-                                        node.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                                    }; None
-                                },
-                    _ => {None}
-                },
+    match event {
+        SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+            propagation_source: peer_id,
+            message_id: id,
+            message,
+        })) => {
+            println!(
+                "Got message: '{}' with id: {id} from peer: {peer_id}",
+                String::from_utf8_lossy(&message.data),
+            );
+        }
+        SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+            for (peer_id, _multiaddr) in list {
+                println!("mDNS discover peer has discovered: {}", peer_id);
+                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
             }
-        };
-
-        if let Some(event) = evt {
-            match event {
-                EventType::Response(resp) => {
-                    println!("{}", resp)
-                }
-                EventType::Input(line) => match line.as_str() {
-                    "ls p" => async_handle_list_peers(&mut node).await,
-                    "ls l" => node.handle_list_listening_node(),
-                    cmd if cmd.starts_with("send ") => node.send_message(cmd),
-                    cmd if cmd.starts_with("connected ") => node.is_connected_to(cmd),
-                    cmd if cmd.starts_with("connect ") => node.connect_to(cmd),
-                    cmd if cmd.starts_with("disconnect ") => node.disconnect_to(cmd),
-                    "stop" => break,
-                    _ => println!("unknown command"),
-                },
+        }
+        SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+            for (peer_id, _multiaddr) in list {
+                println!("mDNS discover peer has expired: {}", peer_id);
+                swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .remove_explicit_peer(&peer_id);
             }
+        }
+        SwarmEvent::ConnectionEstablished {
+            peer_id,
+            connection_id,
+            endpoint,
+            num_established,
+            concurrent_dial_errors,
+            established_in,
+        } => {
+            println!("Connection Established: {}", peer_id);
+        }
+        SwarmEvent::ConnectionClosed {
+            peer_id,
+            connection_id,
+            endpoint,
+            num_established,
+            cause,
+        } => {
+            println!("{}", cause.unwrap().to_string());
+        }
+        SwarmEvent::IncomingConnection {
+            connection_id,
+            local_addr,
+            send_back_addr,
+        } => {
+            println!("In comming connection: {}", connection_id);
+        }
+        SwarmEvent::IncomingConnectionError {
+            connection_id,
+            local_addr,
+            send_back_addr,
+            error,
+        } => {
+            println!(
+                "In comming connection error: {} error {}",
+                connection_id, error
+            );
+        }
+        SwarmEvent::OutgoingConnectionError {
+            connection_id,
+            peer_id,
+            error,
+        } => {
+            println!(
+                "Out going connection error: {} error {}",
+                connection_id, error
+            );
+        }
+        SwarmEvent::NewListenAddr {
+            listener_id,
+            address,
+        } => {
+            println!("new listen address: {}", address);
+        }
+        SwarmEvent::ExpiredListenAddr {
+            listener_id,
+            address,
+        } => {
+            println!("expired listen address: {}", address);
+        }
+        SwarmEvent::ListenerClosed {
+            listener_id,
+            addresses,
+            reason,
+        } => {
+            println!("Listener closed: {} ", listener_id);
+            addresses.iter().for_each(|f| println!("{}", f))
+        }
+        SwarmEvent::ListenerError { listener_id, error } => {
+            println!("Listener error: {} error {}", listener_id, error);
+        }
+        SwarmEvent::Dialing {
+            peer_id,
+            connection_id,
+        } => {
+            println!(
+                "Dialing peer: {} with connection: {}",
+                peer_id.unwrap(),
+                connection_id
+            );
+        }
+        SwarmEvent::NewExternalAddrCandidate { address } => {
+            println!("new external address candidate: {}", address);
+        }
+        SwarmEvent::ExternalAddrConfirmed { address } => {
+            println!("external address confirmed: {}", address);
+        }
+        SwarmEvent::ExternalAddrExpired { address } => {
+            println!("external address expired: {}", address);
+        }
+        _ => {}
+    }
+}
+
+async fn handle_command(node: &mut Node, command: Command, swarm: &mut Swarm<MyBehaviour>) {
+    match command {
+        Command::SubscribeTopic { topic, sender } => {
+            let topic = gossipsub::IdentTopic::new(topic.as_str());
+            // let mut swarm = node.swarm.lock().await;
+            swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
+            // node.topics.insert(topic.into());
+        }
+        Command::UnSubscribeTopic { topic, sender } => {
+            let topic = gossipsub::IdentTopic::new(topic.as_str());
+            // let mut swarm = node.swarm.lock().await;
+            let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&topic).unwrap();
+            // node.topics.remove(&topic.into());
+        }
+        Command::GetConnectedPeers { sender } => {
+            let mut list = HashSet::new();
+            swarm.behaviour().gossipsub.all_peers().for_each(|f| {
+                list.insert((*f.0).to_string());
+            });
+            sender.send(list).unwrap();
+        }
+        Command::GetDiscoveredPeers { sender } => {
+            let mut list = HashSet::new();
+            let nodes = swarm.behaviour().mdns.discovered_nodes();
+            for peer in nodes {
+                list.insert((*peer).to_string());
+            }
+            sender.send(list).unwrap();
+        }
+        Command::ListeningAddress { sender } => {
+            let mut list = HashSet::new();
+            swarm.listeners().for_each(|f| {
+                list.insert(f.to_string());
+            });
+            sender.send(list).unwrap();
+        }
+        Command::SendToOne { topic, message } => {
+            println!("Message : {}", message);
+            if let Err(e) = swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(topic, message.as_bytes())
+            {
+                println!("Publish error: {e:?}");
+            }
+        }
+        Command::ConnectPeer { peer_id } => {
+            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
         }
     }
 }
 
-async fn async_handle_list_peers(node: &mut Node) {
-    println!("Discovered Peers:");
-    let nodes = node.swarm.behaviour().mdns.discovered_nodes();
-    let mut unique_peers = HashSet::new();
-    for peer in nodes {
-        unique_peers.insert(peer);
-        node.peers_id.insert(*peer);
-    }
-    unique_peers.iter().for_each(|p| println!("{}", p));
+#[derive(Debug)]
+enum Command {
+    SubscribeTopic {
+        topic: String,
+        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>,
+    },
+    UnSubscribeTopic {
+        topic: String,
+        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>,
+    },
+    SendToOne {
+        topic: TopicHash,
+        message: String,
+    },
+    GetConnectedPeers {
+        sender: oneshot::Sender<HashSet<String>>,
+    },
+    GetDiscoveredPeers {
+        sender: oneshot::Sender<HashSet<String>>,
+    },
+    ListeningAddress {
+        sender: oneshot::Sender<HashSet<String>>,
+    },
+    ConnectPeer {
+        peer_id: PeerId,
+    },
+}
+
+enum Event {
+    InCommingMessage {
+        propagation_source: PeerId,
+        message_id: MessageId,
+        topic: TopicHash,
+        message: String,
+    },
+}
+
+fn peer_id_from_str(val: &str) -> PeerId {
+    let bytes = bs58::decode(val).into_vec().unwrap();
+    let peer_id = PeerId::from_bytes(&bytes).unwrap();
+    peer_id
 }
