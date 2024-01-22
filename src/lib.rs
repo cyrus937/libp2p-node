@@ -125,7 +125,6 @@ impl Network {
             }
         }
         );
-        println!("Out of the runtime");
     }
 
     fn subscribe_topic(&mut self, topic: String) {
