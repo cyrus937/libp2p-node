@@ -31,11 +31,8 @@ pip install patchelf
 ```
 maturin develop
 
-#To execute the code without errors
 RUST_BACKTRACE=full python py_scripts/test.py  
 
-#To execute the code with errors
-RUST_BACKTRACE=full python py_scripts/test.py err
 ```
 <!-- 2. Install dependencies
 ```
@@ -45,7 +42,7 @@ cargo install --path .
 ```
 cargo run
 ```-->
-Expected : 
+<!--Expected : 
 ```
 Peer ID : 12D3KooWQafztgWfmHT4YbEYYG5ayTqFYdyaS12YPseuKgXTwS39.
 Enter the command : 
