@@ -26,7 +26,6 @@ pub struct MyBehaviour {
     mdns: mdns::tokio::Behaviour,
 }
 
-#[derive(Clone)]
 #[pyclass(name = "Node", subclass)]
 pub struct Node {
     pub id: PeerId,
@@ -37,12 +36,11 @@ pub struct Node {
     pub discovered_peers: HashSet<String>,
     #[pyo3(get, set)]
     pub listening_address: HashSet<String>,
-    pub swarm: Arc<tokio::sync::Mutex<Swarm<MyBehaviour>>>,
+    pub swarm: Swarm<MyBehaviour>,
     command_receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<Command>>>,
     event_sender: mpsc::Sender<Event>,
 }
 
-#[derive(Clone)]
 #[pyclass(name = "Client", subclass)]
 pub struct Client {
     id: PeerId,
@@ -50,12 +48,9 @@ pub struct Client {
     topics: HashMap<String, TopicHash>,
 }
 
-#[derive(Clone)]
 #[pyclass(name = "Network", subclass)]
 pub struct Network {
-    #[pyo3(get, set)]
     pub client: Client,
-    #[pyo3(get, set)]
     pub node: Node,
     event_receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<Event>>>,
 }
@@ -90,6 +85,7 @@ impl Network {
                 .unwrap()
         });
         let node = t.2;
+        drop(rt);
 
         Ok(Network {
             client: t.0,
@@ -98,71 +94,61 @@ impl Network {
         })
     }
 
-    fn run<'py>(&self, py: Python<'py>) {
-        let network = self.clone();
-        let handle = tokio::runtime::Runtime::new().unwrap();
-        let _ = handle.block_on(async {
-            let mut node = network.node;
-            let swarm_arc_clone = Arc::clone(&node.swarm);
-            let mut swarm_guard = swarm_arc_clone.lock().await;
-            let swarm = &mut *swarm_guard;
+    fn run(&mut self) {
+        let handle = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+        handle.block_on(
+            async {
 
-            let command_arc_clone = Arc::clone(&node.command_receiver);
-            let mut command_guard = command_arc_clone.lock().await;
-            let command_receiver = &mut *command_guard;
+                let command_arc_clone = Arc::clone(&self.node.command_receiver);
+                let mut command_guard = command_arc_clone.lock().await;
+                let command_receiver = &mut *command_guard;
 
-            loop {
-                // let evt = {
-                futures::select! {
-                    event = swarm.next() => handle_event(&mut node, event.expect("Swarm stream to be infinite."), swarm).await,
-                    command = command_receiver.next() => match command {
-                        Some(c) => {
-                            handle_command(&mut node, c, swarm).await},
-                        // Command channel closed, thus shutting down the network event loop.
-                        None=>  {},
-                    },
-                };
+                loop {
+                    tokio::select! {
+                        event = self.node.swarm.next() => handle_event(event.expect("Swarm stream to be infinite."), &mut self.node.swarm).await,
+                        command = command_receiver.next() => match command {
+                            Some(c) => {
+                                handle_command(c, &mut self.node.swarm).await},
+                            // Command channel closed, thus shutting down the network event loop.
+                            None=>  {},
+                        },
+                    };
+                }
             }
-        }
         );
     }
 
     fn subscribe_topic(&mut self, topic: String) {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        // let rt = Handle::current();
         let _ = rt.block_on(async { self.client.async_subscribe_topic(topic).await });
     }
 
     fn unsubscribe_topic(&mut self, topic: String) {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        // let rt = Handle::current();
         let _ = rt.block_on(async { self.client.async_unsubscribe_topic(topic).await });
     }
 
     pub fn get_connected_peers(&mut self) -> HashSet<String> {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        // let rt = Handle::current();
         rt.block_on(async { self.client.async_get_connected_peers().await })
     }
 
     pub fn get_discovered_peers(&mut self) -> HashSet<String> {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        // let rt = Handle::current();
         rt.block_on(async { self.client.async_get_discovered_peers().await })
     }
 
     pub fn get_listening_address(&mut self) -> HashSet<String> {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        // let rt = Handle::current();
         rt.block_on(async { self.client.async_get_listening_address().await })
     }
 
     fn send_message(&mut self, topic: String, msg: String) {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        // let rt = Handle::current();
         let _ = rt.block_on(async { self.client.async_send_message(topic, msg).await });
     }
 }
+
 
 impl Client {
     /// Subscribe to a new topic
@@ -349,7 +335,7 @@ async fn create_node(
         id,
         message: String::new(),
         connected_peers: HashSet::new(),
-        swarm: Arc::new(tokio::sync::Mutex::new(swarm)),
+        swarm,
         command_receiver: Arc::new(tokio::sync::Mutex::new(command_receiver)),
         event_sender,
         discovered_peers: HashSet::new(),
@@ -364,7 +350,6 @@ async fn create_node(
 }
 
 async fn handle_event(
-    node: &mut Node,
     event: SwarmEvent<MyBehaviourEvent>,
     swarm: &mut Swarm<MyBehaviour>,
 ) {
@@ -487,13 +472,14 @@ async fn handle_event(
     }
 }
 
-async fn handle_command(node: &mut Node, command: Command, swarm: &mut Swarm<MyBehaviour>) {
+async fn handle_command(
+    command: Command,
+    swarm: &mut Swarm<MyBehaviour>,
+) {
     match command {
         Command::SubscribeTopic { topic, sender } => {
             let topic = gossipsub::IdentTopic::new(topic.as_str());
-            // let mut swarm = node.swarm.lock().await;
             swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
-            // node.topics.insert(topic.into());
         }
         Command::UnSubscribeTopic { topic, sender } => {
             let topic = gossipsub::IdentTopic::new(topic.as_str());
@@ -524,6 +510,10 @@ async fn handle_command(node: &mut Node, command: Command, swarm: &mut Swarm<MyB
             sender.send(list).unwrap();
         }
         Command::SendToOne { topic, message } => {
+            // println!("Connect Peers: {}", peers.len());
+            // for peer_id in peers {
+            //     swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+            // }
             println!("Message : {}", message);
             if let Err(e) = swarm
                 .behaviour_mut()
